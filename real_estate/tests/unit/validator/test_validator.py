@@ -238,6 +238,7 @@ class TestSetWeights:
             "our_hotkey",
         ]
         validator.scores = np.array([1.0, 0.0, 3.0, 0.0, 0.0], dtype=np.float32)
+        validator._pending_weights = {"hotkey_0": 1.0, "hotkey_2": 3.0}
         validator.metagraph = create_mock_metagraph(validator.hotkeys)
 
         # Set up mock chain client
@@ -265,6 +266,7 @@ class TestSetWeights:
             "our_hotkey",
         ]
         validator.scores = np.array([1.0, 0.0, 0.0, 3.0, 0.0], dtype=np.float32)
+        validator._pending_weights = {"hotkey_0": 1.0, "hotkey_3": 3.0}
         validator.metagraph = create_mock_metagraph(validator.hotkeys)
 
         # burn_amount defaults to 0.0, but set burn_uid to verify it's ignored
@@ -297,6 +299,7 @@ class TestSetWeights:
             "our_hotkey",
         ]
         validator.scores = np.array([1.0, 0.0, 0.0, 3.0, 0.0], dtype=np.float32)
+        validator._pending_weights = {"hotkey_0": 1.0, "hotkey_3": 3.0}
         validator.metagraph = create_mock_metagraph(validator.hotkeys)
         validator.config.burn_uid = 2
 
@@ -335,6 +338,7 @@ class TestSetWeights:
         """Test no burn applied when burn_amount is 0."""
         validator.hotkeys = ["hotkey_0", "hotkey_1", "our_hotkey"]
         validator.scores = np.array([1.0, 3.0, 0.0], dtype=np.float32)
+        validator._pending_weights = {"hotkey_0": 1.0, "hotkey_1": 3.0}
         validator.metagraph = create_mock_metagraph(validator.hotkeys)
 
         # No burn configured (defaults)
@@ -365,6 +369,7 @@ class TestSetWeights:
             "our_hotkey",
         ]
         validator.scores = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        validator._pending_weights = {}
         validator.metagraph = create_mock_metagraph(validator.hotkeys)
 
         validator.config.burn_amount = 0.0
@@ -392,6 +397,7 @@ class TestSetWeights:
             "our_hotkey",
         ]
         validator.scores = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        validator._pending_weights = {}
         validator.metagraph = create_mock_metagraph(validator.hotkeys)
         validator.config.burn_uid = 2
 
@@ -470,6 +476,8 @@ class TestRunEvaluationScores:
         assert validator.scores[1] == 0.0  # hotkey_1 - zeroed (was 0.5)
         assert validator.scores[2] == 0.01  # hotkey_2 - from weights
         assert validator.scores[3] == 0.0  # hotkey_3 - zeroed
+        # _pending_weights stores by hotkey (race-free)
+        assert validator._pending_weights == {"hotkey_0": 0.99, "hotkey_2": 0.01}
 
     @pytest.mark.asyncio
     async def test_all_scores_come_from_current_evaluation(
@@ -507,9 +515,118 @@ class TestRunEvaluationScores:
         await validator._run_evaluation(mock_dataset)
 
         # All old scores replaced
+        assert validator._pending_weights == {"hotkey_0": 1.0}
         np.testing.assert_array_equal(
             validator.scores, np.array([1.0, 0.0, 0.0], dtype=np.float32)
         )
+
+
+class TestPendingWeightsRaceCondition:
+    """Tests for the _pending_weights mechanism that prevents the race condition
+    between _evaluation_loop and _weight_setting_loop.
+
+    The race condition: both loops share self.scores (UID-indexed array) and
+    self.hotkeys. If update_metagraph() in the weight-setting loop changes
+    self.hotkeys between when _run_evaluation() writes scores and when
+    set_weights() reads them, scores get mapped to the wrong hotkeys.
+
+    Fix: set_weights() now uses self._pending_weights (hotkey-keyed dict)
+    instead of converting self.scores[uid] -> self.hotkeys[uid].
+    """
+
+    @pytest.mark.asyncio
+    async def test_weights_correct_after_hotkey_remap(
+        self, validator: Validator
+    ) -> None:
+        """Simulate the race: hotkeys change between evaluation and weight-setting.
+
+        Before fix: score at UID 0 (intended for Alice) would be sent to Charlie.
+        After fix: _pending_weights maps directly by hotkey, so Alice gets her weight.
+        """
+        # Step 1: Evaluation assigned weights for Alice (UID 0) and Bob (UID 1)
+        validator.hotkeys = ["Alice", "Bob", "our_hotkey"]
+        validator.scores = np.array([0.99, 0.01, 0.0], dtype=np.float32)
+        validator._pending_weights = {"Alice": 0.99, "Bob": 0.01}
+        validator.metagraph = create_mock_metagraph(validator.hotkeys)
+
+        # Step 2: Simulate update_metagraph() changing hotkeys
+        # (Alice deregistered, Charlie took UID 0)
+        validator.hotkeys = ["Charlie", "Bob", "our_hotkey"]
+        # scores array is now stale: scores[0]=0.99 but hotkeys[0] is "Charlie"
+        validator.metagraph = create_mock_metagraph(validator.hotkeys)
+
+        # Step 3: set_weights() should use _pending_weights, NOT scores array
+        mock_chain = MagicMock()
+        mock_chain.set_weights = AsyncMock()
+        validator.chain = mock_chain
+
+        await validator.set_weights()
+
+        # Verify: Bob should get weight (still registered).
+        # Alice is NOT registered anymore, so her weight is excluded.
+        # Charlie should NOT get Alice's weight (the old bug).
+        mock_chain.set_weights.assert_called_once()
+        weights = mock_chain.set_weights.call_args[0][0]
+        assert "Charlie" not in weights  # Charlie must NOT get Alice's weight
+        assert "Alice" not in weights  # Alice deregistered, excluded
+        assert "Bob" in weights  # Bob still registered
+        assert weights["Bob"] == pytest.approx(1.0)  # Only registered miner, gets 100%
+
+    @pytest.mark.asyncio
+    async def test_pending_weights_populated_by_evaluation(
+        self, validator: Validator
+    ) -> None:
+        """_run_evaluation stores weights in both scores array and _pending_weights."""
+        validator.hotkeys = ["hotkey_0", "hotkey_1"]
+        validator.scores = np.array([0.0, 0.0], dtype=np.float32)
+        validator.metagraph = create_mock_metagraph(validator.hotkeys)
+        validator.download_results = {
+            "hotkey_0": MagicMock(success=True, model_path="/model_0.onnx"),
+        }
+        validator._model_scheduler = MagicMock()
+        validator._model_scheduler.known_commitments = {"hotkey_0": MagicMock()}
+
+        mock_weights = MagicMock()
+        mock_weights.weights = {"hotkey_0": 0.99, "hotkey_1": 0.01}
+        mock_winner = MagicMock()
+        mock_winner.winner_hotkey = "hotkey_0"
+        mock_winner.winner_score = 0.92
+        mock_result = MagicMock()
+        mock_result.weights = mock_weights
+        mock_result.winner = mock_winner
+
+        validator._orchestrator = MagicMock()
+        validator._orchestrator.run = AsyncMock(return_value=mock_result)
+
+        mock_dataset = MagicMock()
+        mock_dataset.__len__ = MagicMock(return_value=5)
+        await validator._run_evaluation(mock_dataset)
+
+        # Both representations should be populated
+        assert validator._pending_weights == {"hotkey_0": 0.99, "hotkey_1": 0.01}
+        assert validator.scores[0] == pytest.approx(0.99)
+        assert validator.scores[1] == pytest.approx(0.01)
+
+    @pytest.mark.asyncio
+    async def test_set_weights_filters_deregistered_from_pending(
+        self, validator: Validator
+    ) -> None:
+        """set_weights excludes hotkeys that are no longer registered."""
+        validator.hotkeys = ["hotkey_0", "our_hotkey"]  # hotkey_1 deregistered
+        validator._pending_weights = {"hotkey_0": 0.99, "hotkey_1": 0.01}
+        validator.scores = np.array([0.99, 0.0], dtype=np.float32)
+        validator.metagraph = create_mock_metagraph(validator.hotkeys)
+
+        mock_chain = MagicMock()
+        mock_chain.set_weights = AsyncMock()
+        validator.chain = mock_chain
+
+        await validator.set_weights()
+
+        mock_chain.set_weights.assert_called_once()
+        weights = mock_chain.set_weights.call_args[0][0]
+        assert "hotkey_1" not in weights  # Deregistered, excluded
+        assert weights["hotkey_0"] == pytest.approx(1.0)  # Re-normalized
 
 
 class TestGetNextEvalTime:
@@ -1038,12 +1155,14 @@ class TestOnValidationDataFetched:
         # Setup: validator has existing scores
         validator.hotkeys = ["hotkey_0", "hotkey_1", "hotkey_2"]
         validator.scores = np.array([0.5, 0.3, 0.2], dtype=np.float32)
+        validator._pending_weights = {"hotkey_0": 0.5, "hotkey_1": 0.3}
 
         # Callback with None (fetch failed after retries exhausted)
         validator._on_validation_data_fetched(None, None)
 
         # Scores should be zeroed so burn mechanism kicks in
         assert np.all(validator.scores == 0.0)
+        assert validator._pending_weights == {}
 
     def test_empty_data_zeros_scores(self, validator: Validator) -> None:
         """When validation data is empty, scores are zeroed for burn."""
@@ -1052,6 +1171,7 @@ class TestOnValidationDataFetched:
         # Setup: validator has existing scores
         validator.hotkeys = ["hotkey_0", "hotkey_1", "hotkey_2"]
         validator.scores = np.array([0.5, 0.3, 0.2], dtype=np.float32)
+        validator._pending_weights = {"hotkey_0": 0.5, "hotkey_1": 0.3}
 
         # Callback with empty dataset
         empty_dataset = ValidationDataset(properties=[])
@@ -1059,6 +1179,7 @@ class TestOnValidationDataFetched:
 
         # Scores should be zeroed so burn mechanism kicks in
         assert np.all(validator.scores == 0.0)
+        assert validator._pending_weights == {}
 
     def test_valid_data_triggers_evaluation(self, validator: Validator) -> None:
         """When validation data is valid, evaluation event is set."""

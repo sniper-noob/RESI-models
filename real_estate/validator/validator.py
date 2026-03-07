@@ -146,6 +146,13 @@ class Validator:
         self.uid: int | None = None
         self.download_results: dict[str, DownloadResult] = {}  # hotkey -> result
 
+        # Race-free weight storage: hotkey -> weight.
+        # Avoids the UID-indexed scores array race condition where
+        # update_metagraph() in the weight-setting loop can remap UIDs
+        # between when _run_evaluation() writes scores and when
+        # set_weights() reads them.
+        self._pending_weights: dict[str, float] = {}
+
         # Block tracker for weight setting
         self._last_weight_set_block: int = 0
 
@@ -260,22 +267,22 @@ class Validator:
             )
             return
 
-        # Handle NaN values
-        if np.isnan(self.scores).any():
-            logger.warning("Scores contain NaN, replacing with 0")
-            self.scores = np.nan_to_num(self.scores, nan=0)
-
-        # Normalize scores to weights
-        total = np.sum(self.scores)
-
-        # Build hotkey -> weight mapping for non-zero weights
+        # Build hotkey -> weight mapping directly from _pending_weights.
+        # This avoids the race condition where update_metagraph() in the
+        # weight-setting loop remaps UIDs between evaluation and weight-setting,
+        # causing scores[uid] to map to the wrong hotkey.
         weights: dict[str, float] = {}
-        if total > 0:
-            normalized_weights = self.scores / total
-            for uid, weight in enumerate(normalized_weights):
-                if weight > 0 and uid < len(self.hotkeys):
-                    hotkey = self.hotkeys[uid]
-                    weights[hotkey] = float(weight)
+        if self._pending_weights:
+            # Filter to currently registered hotkeys (deregistered miners excluded)
+            registered = set(self.hotkeys) if self.hotkeys else set()
+            active = {
+                h: w
+                for h, w in self._pending_weights.items()
+                if h in registered and w > 0 and not (isinstance(w, float) and np.isnan(w))
+            }
+            total = sum(active.values())
+            if total > 0:
+                weights = {h: w / total for h, w in active.items()}
 
         # Apply burn if configured (works even with empty weights)
         weights = self._apply_burn(weights)
@@ -460,6 +467,7 @@ class Validator:
             # TODO: More sophisticated burn logic will be implemented.
             # For now, zero scores so the burn mechanism kicks in on next weight setting.
             self.scores.fill(0.0)
+            self._pending_weights = {}
             return
 
         if len(validation_data) == 0:
@@ -467,6 +475,7 @@ class Validator:
             # TODO: More sophisticated burn logic will be implemented.
             # For now, zero scores so the burn mechanism kicks in on next weight setting.
             self.scores.fill(0.0)
+            self._pending_weights = {}
             return
 
         self.validation_data = validation_data
@@ -508,9 +517,13 @@ class Validator:
 
             # Reset all scores - miners not evaluated get 0
             self.scores.fill(0.0)
+            self._pending_weights = {}
 
             # Update scores from weights
             for hotkey, weight in result.weights.weights.items():
+                # Store by hotkey (race-free, used by set_weights)
+                self._pending_weights[hotkey] = weight
+                # Also store by UID for backward compatibility
                 if hotkey in self.hotkeys:
                     uid = self.hotkeys.index(hotkey)
                     self.scores[uid] = weight
